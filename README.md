@@ -9,6 +9,7 @@ A ComfyUI custom node suite for [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS)
   - **Custom Voice**: Use 9 preset high-quality voices (Vivian, Ryan, etc.).
   - **Voice Design**: Create new voices using natural language descriptions.
   - **Voice Cloning**: Clone voices from a short reference audio clip.
+- **Fine-Tuning**: Train a custom voice model using your own dataset (folder of .wav + .txt files).
 - **Cross-Lingual Support**: Generate speech in Chinese, English, Japanese, Korean, German, French, Russian, Portuguese, Spanish, and Italian.
 - **Flexible Attention**: robust support for `flash_attention_2` with automatic fallback to `sdpa` (standard PyTorch 2.0 attention) if dependencies are missing.
 
@@ -33,7 +34,8 @@ Use the **Qwen3-TTS Loader** node.
 - **repo_id**: Select the model you want to use.
   - `CustomVoice` models: For using preset speakers.
   - `VoiceDesign` models: For designing voices with text prompts.
-  - `Base` models: For voice cloning.
+  - `Base` models: For voice cloning and fine-tuning.
+- **local_model_path**: (Optional) Path to a locally trained/downloaded model.
 - **attention**: Leave at `auto` for best performance (tries Flash Attention 2, falls back to SDPA).
 
 ### 2. Generate Audio
@@ -57,6 +59,30 @@ Connect the loaded model to one of the generator nodes:
 
 ### 3. Advanced: Prompt Caching
 Use the **Qwen3-TTS Prompt Maker** node to pre-calculate the voice features from a reference audio. Connect the output `Qwen3_Prompt` to the **Voice Clone** node. This is faster if you are generating many sentences with the same cloned voice.
+
+## Fine-Tuning
+
+Train a dedicated model for a specific voice.
+
+1.  **Prepare Dataset**:
+    - Organize a folder with `.wav` audio files and corresponding `.txt` transcripts (same filename).
+    - Include a `ref.wav` (representative sample) in the folder, or specify it in the node.
+    - Use **Qwen3-TTS Dataset Maker** node pointing to this folder. It generates a `dataset.jsonl`.
+    
+2.  **Process Data**:
+    - Use **Qwen3-TTS Data Prep** node with the `dataset.jsonl`. It tokenizes audio and creates `*_codes.jsonl`.
+    
+3.  **Fine-Tune**:
+    - Use **Qwen3-TTS Finetune** node.
+    - **train_jsonl**: Connect the `*_codes.jsonl`.
+    - **init_model**: Use `Qwen3-TTS-12Hz-1.7B-Base`.
+    - **output_dir**: Where to save the new model.
+    - **speaker_name**: Name your new voice.
+    - Run the node (Queue Prompt). It might take a while depending on epochs/GPU.
+    
+4.  **Use Fine-Tuned Model**:
+    - Use **Qwen3-TTS Loader** and set `local_model_path` to your fine-tuned `output_dir/epoch_X`.
+    - Use **Qwen3-TTS Custom Voice** node. Your `speaker_name` won't appear in the dropdown, but you can use a primitive STRING node connected to `speaker` input (convert widget to input if needed) and type your `speaker_name`.
 
 ## Credits
 
