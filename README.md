@@ -119,7 +119,7 @@ Train a dedicated model for a specific voice.
     
 4.  **Use Fine-Tuned Model**:
     - Use **Qwen3-TTS Loader** and set `local_model_path` to your fine-tuned `output_dir/epoch_X`.
-    - Use **Qwen3-TTS Custom Voice** node. Your `speaker_name` won't appear in the dropdown, but you can use a primitive STRING node connected to `speaker` input (convert widget to input if needed) and type your `speaker_name`.
+    - Use **Qwen3-TTS Custom Voice** node. Your `speaker_name` won't appear in the dropdown, you should type your exact trained `speaker_name` in the input, and it'll ignore the default voices and use the trained one.
 
 ## Credits
 
