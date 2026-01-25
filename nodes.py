@@ -689,6 +689,7 @@ class Qwen3FineTune:
                 "batch_size": ("INT", {"default": 2, "min": 1, "max": 64}),
                 "lr": ("FLOAT", {"default": 2e-5, "step": 1e-6}),
                 "speaker_name": ("STRING", {"default": "my_speaker"}),
+                "seed": ("INT", {"default": 42, "min": 0, "max": 0xffffffffffffffff}),
             },
             "optional": {
                  "mixed_precision": (["bf16", "fp16", "no"], {"default": "bf16"}),
@@ -700,7 +701,7 @@ class Qwen3FineTune:
     FUNCTION = "train"
     CATEGORY = "Qwen3-TTS/FineTuning"
 
-    def train(self, train_jsonl, init_model, source, output_dir, epochs, batch_size, lr, speaker_name, mixed_precision):
+    def train(self, train_jsonl, init_model, source, output_dir, epochs, batch_size, lr, speaker_name, seed, mixed_precision="bf16"):
         # Resolve init_model path - check ComfyUI folder first, download if needed
         if init_model in QWEN3_TTS_MODELS:
             local_path = get_local_model_path(init_model)
@@ -717,6 +718,11 @@ class Qwen3FineTune:
         # Setup output directory
         full_output_dir = os.path.abspath(output_dir)
         os.makedirs(full_output_dir, exist_ok=True)
+        
+        # Set random seeds for reproducibility
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
         
         # ComfyUI runs in inference_mode by default. 
         # We must disable it and enable gradients properly for the entire scope, including model loading.
@@ -757,7 +763,9 @@ class Qwen3FineTune:
                     train_lines = [json.loads(line) for line in f]
                     
                 dataset = TTSDataset(train_lines, qwen3tts.processor, config)
-                train_dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=dataset.collate_fn)
+                generator = torch.Generator()
+                generator.manual_seed(seed)
+                train_dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=dataset.collate_fn, generator=generator)
                 
                 optimizer = AdamW(qwen3tts.model.parameters(), lr=lr, weight_decay=0.01)
                 
@@ -971,6 +979,14 @@ class Qwen3FineTune:
                      state_dict['talker.model.codec_embedding.weight'][3000] = target_speaker_embedding[0].detach().to(weight.dtype)
                 
                 save_file(state_dict, os.path.join(final_output_path, "model.safetensors"))
+                
+                # Cleanup: free accelerator resources and synchronize CUDA
+                accelerator.free_memory()
+                del model, optimizer, train_dataloader, qwen3tts, unwrapped_model
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
         
                 print(f"Fine-tuning complete. Model saved to {final_output_path}")
-                return (final_output_path,)
+        
+        return (final_output_path,)

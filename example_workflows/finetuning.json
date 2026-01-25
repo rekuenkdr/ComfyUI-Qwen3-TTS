@@ -1,8 +1,8 @@
 {
   "id": "26b557c0-b6a1-4103-95fa-9674c47af988",
   "revision": 0,
-  "last_node_id": 8,
-  "last_link_id": 9,
+  "last_node_id": 9,
+  "last_link_id": 11,
   "nodes": [
     {
       "id": 4,
@@ -26,7 +26,7 @@
           "widget": {
             "name": "local_model_path"
           },
-          "link": 9
+          "link": 11
         }
       ],
       "outputs": [
@@ -160,7 +160,7 @@
           "name": "processed_jsonl_path",
           "type": "STRING",
           "links": [
-            8
+            10
           ]
         }
       ],
@@ -173,56 +173,6 @@
         "",
         "Qwen/Qwen3-TTS-Tokenizer-12Hz",
         "HuggingFace"
-      ]
-    },
-    {
-      "id": 8,
-      "type": "Qwen3FineTune",
-      "pos": [
-        753.537941397446,
-        302.1915238030183
-      ],
-      "size": [
-        270,
-        250
-      ],
-      "flags": {},
-      "order": 2,
-      "mode": 0,
-      "inputs": [
-        {
-          "name": "train_jsonl",
-          "type": "STRING",
-          "widget": {
-            "name": "train_jsonl"
-          },
-          "link": 8
-        }
-      ],
-      "outputs": [
-        {
-          "name": "model_path",
-          "type": "STRING",
-          "links": [
-            9
-          ]
-        }
-      ],
-      "properties": {
-        "cnr_id": "comfyui-qwen3-tts",
-        "ver": "6289ee949a75455e9fe1f90ac6d5f51445f03c73",
-        "Node name for S&R": "Qwen3FineTune"
-      },
-      "widgets_values": [
-        "",
-        "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
-        "HuggingFace",
-        "output/finetuned_model",
-        10,
-        2,
-        0.00002,
-        "my_speaker",
-        "bf16"
       ]
     },
     {
@@ -253,6 +203,58 @@
         "Node name for S&R": "PreviewAudio"
       },
       "widgets_values": []
+    },
+    {
+      "id": 9,
+      "type": "Qwen3FineTune",
+      "pos": [
+        753.537941397446,
+        302.1915238030183
+      ],
+      "size": [
+        270,
+        298
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "train_jsonl",
+          "type": "STRING",
+          "widget": {
+            "name": "train_jsonl"
+          },
+          "link": 10
+        }
+      ],
+      "outputs": [
+        {
+          "name": "model_path",
+          "type": "STRING",
+          "links": [
+            11
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfyui-qwen3-tts",
+        "ver": "16a2df2166060aa32f515fc676477faf13f06e79",
+        "Node name for S&R": "Qwen3FineTune"
+      },
+      "widgets_values": [
+        "",
+        "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+        "HuggingFace",
+        "output/finetuned_model",
+        10,
+        2,
+        0.00002,
+        "my_speaker",
+        42,
+        "fixed",
+        "bf16"
+      ]
     }
   ],
   "links": [
@@ -281,16 +283,16 @@
       "STRING"
     ],
     [
-      8,
+      10,
       7,
       0,
-      8,
+      9,
       0,
       "STRING"
     ],
     [
+      11,
       9,
-      8,
       0,
       4,
       0,
