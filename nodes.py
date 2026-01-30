@@ -965,7 +965,7 @@ class Qwen3FineTune:
                  # Workflow
                  "resume_training": ("BOOLEAN", {"default": False, "tooltip": "Continue training from the latest checkpoint in output_dir."}),
                  "log_every_steps": ("INT", {"default": 10, "min": 1, "max": 1000, "tooltip": "Log training progress every N steps."}),
-                 "save_every_epochs": ("INT", {"default": 1, "min": 1, "max": 100, "tooltip": "Save checkpoint every N epochs. Ignored if save_every_steps > 0."}),
+                 "save_every_epochs": ("INT", {"default": 1, "min": 0, "max": 100, "tooltip": "Save checkpoint every N epochs. Set to 0 to only save final epoch. Ignored if save_every_steps > 0."}),
                  "save_every_steps": ("INT", {"default": 0, "min": 0, "max": 100000, "tooltip": "Save checkpoint every N steps. Set to 0 to use epoch-based saving instead."}),
                  # VRAM Optimizations
                  "mixed_precision": (["bf16", "fp16", "no"], {"default": "bf16", "tooltip": "Mixed precision training mode. bf16 recommended for modern GPUs."}),
@@ -999,27 +999,68 @@ class Qwen3FineTune:
         full_output_dir = os.path.abspath(output_dir)
         os.makedirs(full_output_dir, exist_ok=True)
 
-        # Check for existing checkpoints if resume is enabled
+        # Check for resume checkpoint
         start_epoch = 0
+        resume_from_step = 0  # Track step offset for ckpt_step_N checkpoints
         resume_checkpoint_path = None
+
         if resume_training:
-            # Find latest checkpoint in output_dir
+            # Priority 1: Find checkpoint subfolders (prefer trained-on checkpoints)
             checkpoints = []
-            for item in os.listdir(full_output_dir) if os.path.exists(full_output_dir) else []:
-                if item.startswith("epoch_"):
+            if os.path.exists(full_output_dir):
+                for item in os.listdir(full_output_dir):
+                    item_path = os.path.join(full_output_dir, item)
+                    if os.path.isdir(item_path) and os.path.exists(os.path.join(item_path, "pytorch_model.bin")):
+                        mtime = os.path.getmtime(os.path.join(item_path, "pytorch_model.bin"))
+                        checkpoints.append((mtime, item, item_path))
+
+            if checkpoints:
+                # Sort by mtime (most recent first)
+                checkpoints.sort(key=lambda x: x[0], reverse=True)
+                _, item_name, resume_checkpoint_path = checkpoints[0]
+
+                # Extract epoch OR step number from folder name
+                if item_name.startswith("epoch_"):
                     try:
-                        epoch_num = int(item.split("_")[1])
-                        checkpoint_path = os.path.join(full_output_dir, item)
-                        if os.path.isdir(checkpoint_path):
-                            checkpoints.append((epoch_num, checkpoint_path))
+                        start_epoch = int(item_name.split("_")[1])
                     except (ValueError, IndexError):
                         pass
-            if checkpoints:
-                checkpoints.sort(key=lambda x: x[0], reverse=True)
-                start_epoch = checkpoints[0][0]
-                resume_checkpoint_path = checkpoints[0][1]
-                print(f"Resume enabled: Found checkpoint at epoch {start_epoch}")
-                print(f"Will continue training from epoch {start_epoch + 1} to {start_epoch + epochs}")
+                elif item_name.startswith("ckpt_step_"):
+                    try:
+                        resume_from_step = int(item_name.split("_")[2])
+                    except (ValueError, IndexError):
+                        pass
+
+                print(f"Resume: Found checkpoint '{item_name}' (most recent)")
+            else:
+                # Priority 2: Check if output_dir itself is a checkpoint
+                direct_weights = os.path.join(full_output_dir, "pytorch_model.bin")
+                if os.path.exists(direct_weights):
+                    resume_checkpoint_path = full_output_dir
+                    dir_name = os.path.basename(full_output_dir)
+                    if dir_name.startswith("ckpt_step_"):
+                        try:
+                            resume_from_step = int(dir_name.split("_")[2])
+                        except (ValueError, IndexError):
+                            pass
+                    print(f"Resume: output_dir is a checkpoint, loading from {resume_checkpoint_path}")
+
+            # Load step_offset from checkpoint's training_config.json if not extracted from folder name
+            if resume_checkpoint_path and resume_from_step == 0:
+                training_config_path = os.path.join(resume_checkpoint_path, "training_config.json")
+                if os.path.exists(training_config_path):
+                    with open(training_config_path, 'r') as f:
+                        saved_config = json.load(f)
+                        resume_from_step = saved_config.get("step_offset", 0)
+                        if resume_from_step > 0:
+                            print(f"Loaded step_offset={resume_from_step} from checkpoint config")
+
+            if resume_checkpoint_path:
+                if resume_from_step > 0:
+                    print(f"Will continue from step {resume_from_step}")
+                print(f"Will train epochs {start_epoch + 1} to {start_epoch + epochs}")
+            else:
+                print("Resume enabled but no checkpoints found, starting fresh")
 
         # Resolve init_model path - check ComfyUI folder first, download if needed
         # NOTE: Always use the original base model, not checkpoint - checkpoint's model.safetensors
@@ -1050,9 +1091,21 @@ class Qwen3FineTune:
                 gc.collect()
                 torch.cuda.empty_cache()
 
-                # Accelerator setup - respect ComfyUI's --cpu flag
-                # Effective batch size = batch_size * gradient_accumulation (default: 4)
                 use_cpu = mm.cpu_mode()
+                num_gpus = torch.cuda.device_count()
+                if num_gpus <= 1 or use_cpu:
+                    os.environ.setdefault("RANK", "0")
+                    os.environ.setdefault("WORLD_SIZE", "1")
+                    os.environ.setdefault("LOCAL_RANK", "0")
+                    os.environ.setdefault("MASTER_ADDR", "localhost")
+                    os.environ.setdefault("MASTER_PORT", "29500")
+                else:
+                    for key in ["RANK", "WORLD_SIZE", "LOCAL_RANK"]:
+                        os.environ.pop(key, None)
+                    os.environ.setdefault("MASTER_ADDR", "localhost")
+                    os.environ.setdefault("MASTER_PORT", "29500")
+                    print(f"Multi-GPU training enabled: {num_gpus} GPUs detected")
+
                 accelerator = Accelerator(gradient_accumulation_steps=gradient_accumulation, mixed_precision=mixed_precision, cpu=use_cpu)
 
                 if resume_checkpoint_path:
@@ -1231,6 +1284,13 @@ class Qwen3FineTune:
                     if scheduler:
                         torch.save(scheduler.state_dict(), os.path.join(ckpt_path, "scheduler.pt"))
 
+                    # Save training config with step_offset for resume
+                    training_config = {
+                        "step_offset": resume_from_step,
+                    }
+                    with open(os.path.join(ckpt_path, "training_config.json"), 'w') as f:
+                        json.dump(training_config, f, indent=2)
+
                     print(f"Training checkpoint saved: {ckpt_path}")
                     return ckpt_path
 
@@ -1283,13 +1343,20 @@ class Qwen3FineTune:
                     if scheduler:
                         torch.save(scheduler.state_dict(), os.path.join(ckpt_path, "scheduler.pt"))
 
+                    # Save training config with step_offset for resume
+                    training_config = {
+                        "step_offset": resume_from_step,
+                    }
+                    with open(os.path.join(ckpt_path, "training_config.json"), 'w') as f:
+                        json.dump(training_config, f, indent=2)
+
                     print(f"Final model saved: {ckpt_path}")
                     return ckpt_path
 
                 # Calculate total optimizer steps and global step counter
                 # Use num_update_steps_per_epoch (optimizer steps) not len(train_dataloader) (micro-batches)
-                total_optimizer_steps = num_update_steps_per_epoch * end_epoch
-                global_step = start_epoch * num_update_steps_per_epoch  # Resume from correct optimizer step
+                total_optimizer_steps = num_update_steps_per_epoch * end_epoch + resume_from_step
+                global_step = start_epoch * num_update_steps_per_epoch + resume_from_step  # Resume from correct optimizer step
 
                 for epoch in range(start_epoch, end_epoch):
                     epoch_loss = 0
@@ -1411,7 +1478,7 @@ class Qwen3FineTune:
                     send_status(f"Epoch {epoch + 1}/{end_epoch} - Loss: {avg_loss:.4f}")
 
                     # Epoch-based saving: intermediate checkpoints only (final saved after loop)
-                    if save_every_steps == 0:
+                    if save_every_steps == 0 and save_every_epochs > 0:
                         is_final_epoch = (epoch + 1) == end_epoch
                         should_save_checkpoint = ((epoch + 1) % save_every_epochs == 0) and not is_final_epoch
                         if should_save_checkpoint:
