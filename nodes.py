@@ -214,7 +214,7 @@ class Qwen3Loader:
                 "attention": (["auto", "flash_attention_2", "sdpa", "eager"], {"default": "auto"}),
             },
             "optional": {
-                "local_model_path": ("STRING", {"default": "", "multiline": False}),
+                "local_model_path": ("STRING", {"default": "", "multiline": False, "tooltip": "Path to local model or checkpoint. If checkpoint (no speech_tokenizer/), base model loads from repo_id first."}),
             }
         }
 
@@ -225,10 +225,9 @@ class Qwen3Loader:
 
     def load_model(self, repo_id, source, precision, attention, local_model_path=""):
         device = mm.get_torch_device()
-        
+
         dtype = torch.float32
         if precision == "bf16":
-            # MPS has limited bf16 support; fall back to fp16 on Mac
             if device.type == "mps":
                 dtype = torch.float16
                 print("Note: Using fp16 on MPS (bf16 has limited support)")
@@ -236,39 +235,46 @@ class Qwen3Loader:
                 dtype = torch.bfloat16
         elif precision == "fp16":
             dtype = torch.float16
-            
-        # Determine model path
-        if local_model_path and local_model_path.strip() != "":
-            model_path = local_model_path.strip()
-            print(f"Loading from local path: {model_path}")
+
+        checkpoint_path = None
+        local_path_stripped = local_model_path.strip() if local_model_path else ""
+
+        if local_path_stripped:
+            speech_tokenizer_path = os.path.join(local_path_stripped, "speech_tokenizer")
+            if os.path.exists(speech_tokenizer_path):
+                model_path = local_path_stripped
+                print(f"Loading full model from: {model_path}")
+            else:
+                checkpoint_path = local_path_stripped
+                local_path = get_local_model_path(repo_id)
+                if os.path.exists(local_path) and os.listdir(local_path):
+                    model_path = local_path
+                else:
+                    print(f"Base model not found locally. Downloading {repo_id}...")
+                    model_path = download_model_to_comfyui(repo_id, source)
+                print(f"Loading base model from: {model_path}")
+                print(f"Will apply checkpoint from: {checkpoint_path}")
         else:
-            # Check if model exists in ComfyUI models folder, download if not
             local_path = get_local_model_path(repo_id)
             if os.path.exists(local_path) and os.listdir(local_path):
                 model_path = local_path
                 print(f"Loading from ComfyUI models folder: {model_path}")
             else:
-                # Download only this specific model
                 print(f"Model not found locally. Downloading {repo_id}...")
                 model_path = download_model_to_comfyui(repo_id, source)
 
-        print(f"Loading Qwen3-TTS model: {repo_id} from {model_path} on {device} as {dtype}")
-        
-        # Determine attention implementation
-        attn_impl = "sdpa" # Default to sdpa (torch 2.0+) as it's usually available and fast
-        
+        print(f"Loading Qwen3-TTS model on {device} as {dtype}")
+
+        attn_impl = "sdpa"
         if attention != "auto":
             attn_impl = attention
         else:
-            # Auto-detect
             try:
                 import flash_attn
-                # Also check version metadata as transformers works 
                 import importlib.metadata
                 importlib.metadata.version("flash_attn")
                 attn_impl = "flash_attention_2"
             except Exception:
-                # Fallback to sdpa if flash_attn missing or metadata broken
                 attn_impl = "sdpa"
 
         print(f"Using attention implementation: {attn_impl}")
@@ -279,10 +285,19 @@ class Qwen3Loader:
             dtype=dtype,
             attn_implementation=attn_impl
         )
-        
+
+        if checkpoint_path:
+            ckpt_weights = os.path.join(checkpoint_path, "pytorch_model.bin")
+            if os.path.exists(ckpt_weights):
+                state_dict = torch.load(ckpt_weights, map_location="cpu")
+                model.model.load_state_dict(state_dict, strict=False)
+                print(f"Loaded checkpoint weights from {ckpt_weights}")
+            else:
+                raise ValueError(f"Checkpoint weights not found: {ckpt_weights}")
+
         # FORCE SPEAKER MAPPING FIX - Deep Injection
         try:
-            cfg_file = os.path.join(model_path, "config.json")
+            cfg_file = os.path.join(checkpoint_path, "config.json") if checkpoint_path else os.path.join(model_path, "config.json")
             if os.path.exists(cfg_file):
                 with open(cfg_file, 'r', encoding='utf-8') as f:
                     cfg_data = json.load(f)
@@ -327,6 +342,22 @@ class Qwen3Loader:
                         print(f"DEBUG: Successfully injected custom speaker mapping: {new_spk_id}", flush=True)
                     else:
                         print("DEBUG: Failed to find an appropriate config object to inject mapping into.", flush=True)
+
+                # Inject tts_model_type if present in checkpoint config
+                if "tts_model_type" in cfg_data:
+                    new_tts_model_type = cfg_data["tts_model_type"]
+
+                    # Inject into config objects
+                    for root_cfg in configs_to_update:
+                        if hasattr(root_cfg, "tts_model_type"):
+                            setattr(root_cfg, "tts_model_type", new_tts_model_type)
+
+                    # CRITICAL: Also update the direct attribute on the inner model
+                    # This is what generate_custom_voice() actually checks
+                    if hasattr(model, "model") and hasattr(model.model, "tts_model_type"):
+                        model.model.tts_model_type = new_tts_model_type
+
+                    print(f"DEBUG: Injected tts_model_type = {new_tts_model_type}", flush=True)
         except Exception as e:
             print(f"DEBUG: Error during deep speaker injection: {e}", flush=True)
         
@@ -939,10 +970,10 @@ class Qwen3FineTune:
                  # Workflow
                  "resume_training": ("BOOLEAN", {"default": False, "tooltip": "Continue training from the latest checkpoint in output_dir."}),
                  "log_every_steps": ("INT", {"default": 10, "min": 1, "max": 1000, "tooltip": "Log training progress every N steps."}),
-                 "save_every_epochs": ("INT", {"default": 1, "min": 1, "max": 100, "tooltip": "Save checkpoint every N epochs. Set to 1 to save every epoch."}),
-                 "save_every_steps": ("INT", {"default": 0, "min": 0, "max": 100000, "tooltip": "Save checkpoint every N steps. Set to 0 to disable step-based saving."}),
+                 "save_every_epochs": ("INT", {"default": 1, "min": 0, "max": 100, "tooltip": "Save checkpoint every N epochs. Set to 0 to only save final epoch. Ignored if save_every_steps > 0."}),
+                 "save_every_steps": ("INT", {"default": 0, "min": 0, "max": 100000, "tooltip": "Save checkpoint every N steps. Set to 0 to use epoch-based saving instead."}),
                  # VRAM Optimizations
-                 "mixed_precision": (["bf16", "fp16", "no"], {"default": "bf16", "tooltip": "Mixed precision training mode. bf16 recommended for modern GPUs."}),
+                 "mixed_precision": (["bf16", "fp32"], {"default": "bf16", "tooltip": "bf16 recommended. Use fp32 only if GPU doesn't support bf16 (pre-Ampere)."}),
                  "gradient_accumulation": ("INT", {"default": 4, "min": 1, "max": 32, "tooltip": "Accumulate gradients over N steps before updating. Effective batch size = batch_size * gradient_accumulation."}),
                  "gradient_checkpointing": ("BOOLEAN", {"default": True, "tooltip": "Trade compute for VRAM by recomputing activations. Saves ~30-40% VRAM."}),
                  "use_8bit_optimizer": ("BOOLEAN", {"default": True, "tooltip": "Use 8-bit AdamW optimizer. Saves ~50% optimizer VRAM. Requires bitsandbytes."}),
@@ -952,6 +983,7 @@ class Qwen3FineTune:
                  # Learning Rate Schedule
                  "warmup_steps": ("INT", {"default": 0, "min": 0, "max": 10000, "tooltip": "Number of warmup steps. Set to 0 to disable warmup. Recommended: 5-10% of total steps."}),
                  "warmup_ratio": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 0.5, "step": 0.01, "tooltip": "Warmup as ratio of total steps. Ignored if warmup_steps > 0. E.g., 0.1 = 10% warmup."}),
+                 "save_optimizer_state": ("BOOLEAN", {"default": False, "tooltip": "Save optimizer/scheduler state in checkpoints. Enables perfect resume but doubles checkpoint size."}),
             },
             "hidden": {
                 "unique_id": "UNIQUE_ID",
@@ -963,7 +995,7 @@ class Qwen3FineTune:
     FUNCTION = "train"
     CATEGORY = "Qwen3-TTS/FineTuning"
 
-    def train(self, train_jsonl, init_model, source, output_dir, epochs, batch_size, lr, speaker_name, seed, mixed_precision="bf16", resume_training=False, log_every_steps=10, save_every_epochs=1, save_every_steps=0, gradient_accumulation=4, gradient_checkpointing=True, use_8bit_optimizer=True, weight_decay=0.01, max_grad_norm=1.0, warmup_steps=0, warmup_ratio=0.0, unique_id=None):
+    def train(self, train_jsonl, init_model, source, output_dir, epochs, batch_size, lr, speaker_name, seed, mixed_precision="bf16", resume_training=False, log_every_steps=10, save_every_epochs=1, save_every_steps=0, gradient_accumulation=4, gradient_checkpointing=True, use_8bit_optimizer=True, weight_decay=0.01, max_grad_norm=1.0, warmup_steps=0, warmup_ratio=0.0, save_optimizer_state=False, unique_id=None):
         # Helper to send progress text to UI
         def send_status(text):
             if unique_id:
@@ -973,27 +1005,68 @@ class Qwen3FineTune:
         full_output_dir = os.path.abspath(output_dir)
         os.makedirs(full_output_dir, exist_ok=True)
 
-        # Check for existing checkpoints if resume is enabled
+        # Check for resume checkpoint
         start_epoch = 0
+        resume_from_step = 0  # Track step offset for ckpt_step_N checkpoints
         resume_checkpoint_path = None
+
         if resume_training:
-            # Find latest checkpoint in output_dir
+            # Priority 1: Find checkpoint subfolders (prefer trained-on checkpoints)
             checkpoints = []
-            for item in os.listdir(full_output_dir) if os.path.exists(full_output_dir) else []:
-                if item.startswith("epoch_"):
+            if os.path.exists(full_output_dir):
+                for item in os.listdir(full_output_dir):
+                    item_path = os.path.join(full_output_dir, item)
+                    if os.path.isdir(item_path) and os.path.exists(os.path.join(item_path, "pytorch_model.bin")):
+                        mtime = os.path.getmtime(os.path.join(item_path, "pytorch_model.bin"))
+                        checkpoints.append((mtime, item, item_path))
+
+            if checkpoints:
+                # Sort by mtime (most recent first)
+                checkpoints.sort(key=lambda x: x[0], reverse=True)
+                _, item_name, resume_checkpoint_path = checkpoints[0]
+
+                # Extract epoch OR step number from folder name
+                if item_name.startswith("epoch_"):
                     try:
-                        epoch_num = int(item.split("_")[1])
-                        checkpoint_path = os.path.join(full_output_dir, item)
-                        if os.path.isdir(checkpoint_path):
-                            checkpoints.append((epoch_num, checkpoint_path))
+                        start_epoch = int(item_name.split("_")[1])
                     except (ValueError, IndexError):
                         pass
-            if checkpoints:
-                checkpoints.sort(key=lambda x: x[0], reverse=True)
-                start_epoch = checkpoints[0][0]
-                resume_checkpoint_path = checkpoints[0][1]
-                print(f"Resume enabled: Found checkpoint at epoch {start_epoch}")
-                print(f"Will continue training from epoch {start_epoch + 1} to {start_epoch + epochs}")
+                elif item_name.startswith("ckpt_step_"):
+                    try:
+                        resume_from_step = int(item_name.split("_")[2])
+                    except (ValueError, IndexError):
+                        pass
+
+                print(f"Resume: Found checkpoint '{item_name}' (most recent)")
+            else:
+                # Priority 2: Check if output_dir itself is a checkpoint
+                direct_weights = os.path.join(full_output_dir, "pytorch_model.bin")
+                if os.path.exists(direct_weights):
+                    resume_checkpoint_path = full_output_dir
+                    dir_name = os.path.basename(full_output_dir)
+                    if dir_name.startswith("ckpt_step_"):
+                        try:
+                            resume_from_step = int(dir_name.split("_")[2])
+                        except (ValueError, IndexError):
+                            pass
+                    print(f"Resume: output_dir is a checkpoint, loading from {resume_checkpoint_path}")
+
+            # Load step_offset from checkpoint's training_config.json if not extracted from folder name
+            if resume_checkpoint_path and resume_from_step == 0:
+                training_config_path = os.path.join(resume_checkpoint_path, "training_config.json")
+                if os.path.exists(training_config_path):
+                    with open(training_config_path, 'r') as f:
+                        saved_config = json.load(f)
+                        resume_from_step = saved_config.get("step_offset", 0)
+                        if resume_from_step > 0:
+                            print(f"Loaded step_offset={resume_from_step} from checkpoint config")
+
+            if resume_checkpoint_path:
+                if resume_from_step > 0:
+                    print(f"Will continue from step {resume_from_step}")
+                print(f"Will train epochs {start_epoch + 1} to {start_epoch + epochs}")
+            else:
+                print("Resume enabled but no checkpoints found, starting fresh")
 
         # Resolve init_model path - check ComfyUI folder first, download if needed
         # NOTE: Always use the original base model, not checkpoint - checkpoint's model.safetensors
@@ -1024,10 +1097,35 @@ class Qwen3FineTune:
                 gc.collect()
                 torch.cuda.empty_cache()
 
-                # Accelerator setup - respect ComfyUI's --cpu flag
-                # Effective batch size = batch_size * gradient_accumulation (default: 4)
                 use_cpu = mm.cpu_mode()
-                accelerator = Accelerator(gradient_accumulation_steps=gradient_accumulation, mixed_precision=mixed_precision, cpu=use_cpu)
+                num_gpus = torch.cuda.device_count()
+                if num_gpus <= 1 or use_cpu:
+                    os.environ.setdefault("RANK", "0")
+                    os.environ.setdefault("WORLD_SIZE", "1")
+                    os.environ.setdefault("LOCAL_RANK", "0")
+                    os.environ.setdefault("MASTER_ADDR", "localhost")
+                    os.environ.setdefault("MASTER_PORT", "29500")
+                else:
+                    for key in ["RANK", "WORLD_SIZE", "LOCAL_RANK"]:
+                        os.environ.pop(key, None)
+                    os.environ.setdefault("MASTER_ADDR", "localhost")
+                    os.environ.setdefault("MASTER_PORT", "29500")
+                    print(f"Multi-GPU training enabled: {num_gpus} GPUs detected")
+
+                # Check GPU bf16 support and fallback to fp32 if needed
+                actual_mixed_precision = mixed_precision
+                if not use_cpu and torch.cuda.is_available() and mixed_precision == "bf16":
+                    device_cap = torch.cuda.get_device_capability()
+                    gpu_name = torch.cuda.get_device_name()
+                    # bf16 requires compute capability >= 8.0 (Ampere+)
+                    if device_cap[0] < 8:
+                        print(f"Warning: {gpu_name} (compute {device_cap[0]}.{device_cap[1]}) does not support bf16.")
+                        print("Falling back to fp32. Note: FP32 uses ~2x more VRAM than bf16.")
+                        actual_mixed_precision = "fp32"
+
+                # Accelerator uses "no" for fp32
+                accel_precision = "no" if actual_mixed_precision == "fp32" else actual_mixed_precision
+                accelerator = Accelerator(gradient_accumulation_steps=gradient_accumulation, mixed_precision=accel_precision, cpu=use_cpu)
 
                 if resume_checkpoint_path:
                     print(f"Loading base model: {init_model_path} (will apply checkpoint weights from {resume_checkpoint_path})")
@@ -1040,12 +1138,12 @@ class Qwen3FineTune:
                      import importlib.metadata
                      importlib.metadata.version("flash_attn")
                      attn_impl = "flash_attention_2"
-                except:
+                except Exception:
                      pass
 
                 print(f"Using attention implementation: {attn_impl}")
 
-                dtype = torch.bfloat16 if mixed_precision == "bf16" else torch.float16 if mixed_precision == "fp16" else torch.float32
+                dtype = torch.bfloat16 if actual_mixed_precision == "bf16" else torch.float32
 
                 qwen3tts = Qwen3TTSModel.from_pretrained(
                     init_model_path,
@@ -1168,24 +1266,69 @@ class Qwen3FineTune:
                 end_epoch = start_epoch + epochs
                 print(f"Starting training from epoch {start_epoch + 1} to {end_epoch}...")
 
-                # Helper function to save a checkpoint
-                def save_checkpoint(checkpoint_name, current_step=None):
+                # Helper function to save a training checkpoint (also inference-ready)
+                def save_training_checkpoint(checkpoint_name):
+                    """Save checkpoint for resuming training. Also inference-ready."""
+                    ckpt_path = os.path.join(full_output_dir, checkpoint_name)
+                    os.makedirs(ckpt_path, exist_ok=True)
+
+                    # Save training weights with speaker embedding injected
+                    unwrapped = accelerator.unwrap_model(model)
+                    state_dict = {k: v.cpu() for k, v in unwrapped.state_dict().items()}
+
+                    # Inject speaker embedding at index 3000 (for inference)
+                    if target_speaker_embedding is not None:
+                        weight = state_dict['talker.model.codec_embedding.weight']
+                        state_dict['talker.model.codec_embedding.weight'][3000] = target_speaker_embedding[0].detach().cpu().to(weight.dtype)
+
+                    torch.save(state_dict, os.path.join(ckpt_path, "pytorch_model.bin"))
+
+                    # Save config for inference (speaker mapping)
+                    base_cfg_path = os.path.join(init_model_path, "config.json")
+                    with open(base_cfg_path, 'r', encoding='utf-8') as f:
+                        ckpt_cfg = json.load(f)
+
+                    ckpt_cfg["tts_model_type"] = "custom_voice"
+                    spk_key = speaker_name.lower()
+                    ckpt_cfg["talker_config"]["spk_id"] = {spk_key: 3000}
+                    ckpt_cfg["talker_config"]["spk_is_dialect"] = {spk_key: False}
+
+                    with open(os.path.join(ckpt_path, "config.json"), 'w', encoding='utf-8') as f:
+                        json.dump(ckpt_cfg, f, indent=2, ensure_ascii=False)
+
+                    if save_optimizer_state:
+                        torch.save(optimizer.state_dict(), os.path.join(ckpt_path, "optimizer.pt"))
+                        if scheduler:
+                            torch.save(scheduler.state_dict(), os.path.join(ckpt_path, "scheduler.pt"))
+
+                    # Save training config with step_offset for resume
+                    training_config = {
+                        "step_offset": resume_from_step,
+                    }
+                    with open(os.path.join(ckpt_path, "training_config.json"), 'w') as f:
+                        json.dump(training_config, f, indent=2)
+
+                    print(f"Training checkpoint saved: {ckpt_path}")
+                    return ckpt_path
+
+                # Helper function to save final inference-ready model
+                def save_final_model(checkpoint_name):
+                    """Save complete model ready for inference and resume."""
                     ckpt_path = os.path.join(full_output_dir, checkpoint_name)
 
-                    # Copy entire Base model directory (official approach)
-                    # This preserves exact config structure for proper loading
-                    shutil.copytree(init_model_path, ckpt_path, dirs_exist_ok=True)
+                    # Copy config files only (exclude speech_tokenizer, model files)
+                    def ignore_files(directory, files):
+                        ignored = set()
+                        if directory == init_model_path:
+                            if "speech_tokenizer" in files:
+                                ignored.add("speech_tokenizer")
+                            if "model.safetensors" in files:
+                                ignored.add("model.safetensors")
+                            if "pytorch_model.bin" in files:
+                                ignored.add("pytorch_model.bin")
+                        return ignored
 
-                    # Save training weights
-                    unwrapped = accelerator.unwrap_model(model)
-                    torch.save(unwrapped.state_dict(), os.path.join(ckpt_path, "pytorch_model.bin"))
-
-                    # Save optimizer state for resume
-                    torch.save(optimizer.state_dict(), os.path.join(ckpt_path, "optimizer.pt"))
-
-                    # Save scheduler state for resume
-                    if scheduler:
-                        torch.save(scheduler.state_dict(), os.path.join(ckpt_path, "scheduler.pt"))
+                    shutil.copytree(init_model_path, ckpt_path, ignore=ignore_files, dirs_exist_ok=True)
 
                     # Modify config.json for custom voice
                     ckpt_cfg_path = os.path.join(ckpt_path, "config.json")
@@ -1200,29 +1343,37 @@ class Qwen3FineTune:
                     with open(ckpt_cfg_path, 'w', encoding='utf-8') as f:
                         json.dump(ckpt_cfg, f, indent=2, ensure_ascii=False)
 
-                    # Overwrite model.safetensors with finetuned weights + speaker embedding
-                    state_dict = unwrapped.state_dict()
-                    state_dict = {k: v.cpu() for k, v in state_dict.items()}
+                    # Save weights with speaker embedding injected (keeps speaker_encoder for resume)
+                    unwrapped = accelerator.unwrap_model(model)
+                    state_dict = {k: v.cpu() for k, v in unwrapped.state_dict().items()}
 
-                    # Remove speaker_encoder weights (not needed for inference)
-                    keys_to_drop = [k for k in state_dict.keys() if k.startswith("speaker_encoder")]
-                    for k in keys_to_drop:
-                        del state_dict[k]
-
-                    # Inject speaker embedding at index 3000
+                    # Inject speaker embedding at index 3000 (for inference)
                     if target_speaker_embedding is not None:
                         weight = state_dict['talker.model.codec_embedding.weight']
                         state_dict['talker.model.codec_embedding.weight'][3000] = target_speaker_embedding[0].detach().cpu().to(weight.dtype)
 
-                    save_file(state_dict, os.path.join(ckpt_path, "model.safetensors"))
+                    # Save as pytorch_model.bin (works for both inference and resume)
+                    torch.save(state_dict, os.path.join(ckpt_path, "pytorch_model.bin"))
 
-                    print(f"Checkpoint saved: {ckpt_path}")
+                    if save_optimizer_state:
+                        torch.save(optimizer.state_dict(), os.path.join(ckpt_path, "optimizer.pt"))
+                        if scheduler:
+                            torch.save(scheduler.state_dict(), os.path.join(ckpt_path, "scheduler.pt"))
+
+                    # Save training config with step_offset for resume
+                    training_config = {
+                        "step_offset": resume_from_step,
+                    }
+                    with open(os.path.join(ckpt_path, "training_config.json"), 'w') as f:
+                        json.dump(training_config, f, indent=2)
+
+                    print(f"Final model saved: {ckpt_path}")
                     return ckpt_path
 
                 # Calculate total optimizer steps and global step counter
                 # Use num_update_steps_per_epoch (optimizer steps) not len(train_dataloader) (micro-batches)
-                total_optimizer_steps = num_update_steps_per_epoch * end_epoch
-                global_step = start_epoch * num_update_steps_per_epoch  # Resume from correct optimizer step
+                total_optimizer_steps = num_update_steps_per_epoch * end_epoch + resume_from_step
+                global_step = start_epoch * num_update_steps_per_epoch + resume_from_step  # Resume from correct optimizer step
 
                 for epoch in range(start_epoch, end_epoch):
                     epoch_loss = 0
@@ -1249,16 +1400,21 @@ class Qwen3FineTune:
                             codec_0_labels = batch['codec_0_labels']
                             codec_mask = batch['codec_mask']
                             
-                            speaker_embedding = model.speaker_encoder(ref_mels.to(model.device).to(model.dtype)).detach()
+                            # Unwrap model to access attributes (DDP/FSDP wrappers hide them)
+                            unwrapped_model = accelerator.unwrap_model(model)
+
+                            # Get device/dtype from model parameters (DDP wrappers don't expose these directly)
+                            model_dtype = next(unwrapped_model.parameters()).dtype
+                            model_device = next(unwrapped_model.parameters()).device
+                            speaker_embedding = unwrapped_model.speaker_encoder(ref_mels.to(model_device).to(model_dtype)).detach()
                             if target_speaker_embedding is None:
                                 target_speaker_embedding = speaker_embedding
-                                
+
                             input_text_ids = input_ids[:, :, 0]
                             input_codec_ids = input_ids[:, :, 1]
-                            
-                            # Use model directly (accelerator unwraps attributes automatically usually)
-                            # If model is DDP, it might fail, but for single GPU Comfy it should pass attributes.
-                            current_model = model
+
+                            # Use unwrapped model for attribute access (DDP/FSDP wrappers hide them)
+                            current_model = unwrapped_model
                             
                             # Debug Gradient Flow
                             if steps == 0 and epoch == start_epoch:
@@ -1310,15 +1466,15 @@ class Qwen3FineTune:
                                     print(f"DEBUG: sub_talker_loss requires_grad: {sub_talker_loss.requires_grad}")
                             
                             accelerator.backward(loss)
-                            
+
                             if accelerator.sync_gradients:
                                 accelerator.clip_grad_norm_(model.parameters(), max_grad_norm)
-                                
+
                             optimizer.step()
                             if scheduler:
                                 scheduler.step()
                             optimizer.zero_grad()
-                            
+
                             epoch_loss += loss.item()
                             steps += 1
 
@@ -1333,23 +1489,27 @@ class Qwen3FineTune:
                                     print(status)
                                     send_status(status)
 
-                                # Save checkpoint every N steps (if enabled)
+                                # Step-based saving: only lightweight checkpoints during training
+                                # (final model is always saved as epoch_N after training loop)
                                 if save_every_steps > 0 and global_step % save_every_steps == 0:
                                     send_status(f"Saving checkpoint step {global_step}...")
-                                    save_checkpoint(f"step_{global_step}")
+                                    save_training_checkpoint(f"ckpt_step_{global_step}")
 
                     avg_loss = epoch_loss/steps if steps > 0 else 0
                     print(f"Epoch {epoch + 1}/{end_epoch} - Avg Loss: {avg_loss}")
                     send_status(f"Epoch {epoch + 1}/{end_epoch} - Loss: {avg_loss:.4f}")
 
-                    # Save checkpoint every N epochs (if enabled), or always save final epoch
-                    is_final_epoch = (epoch + 1) == end_epoch
-                    should_save = is_final_epoch or (save_every_epochs > 0 and (epoch + 1) % save_every_epochs == 0)
-                    if should_save:
-                        send_status(f"Saving checkpoint epoch {epoch + 1}...")
-                        save_checkpoint(f"epoch_{epoch + 1}")
+                    # Epoch-based saving: intermediate checkpoints only (final saved after loop)
+                    if save_every_steps == 0 and save_every_epochs > 0:
+                        is_final_epoch = (epoch + 1) == end_epoch
+                        should_save_checkpoint = ((epoch + 1) % save_every_epochs == 0) and not is_final_epoch
+                        if should_save_checkpoint:
+                            send_status(f"Saving checkpoint epoch {epoch + 1}...")
+                            save_training_checkpoint(f"ckpt_epoch_{epoch + 1}")
 
-                # Final output path (already saved by the epoch loop)
+                # Always save final model as epoch_N for consistent resume
+                send_status(f"Saving final model epoch {end_epoch}...")
+                save_final_model(f"epoch_{end_epoch}")
                 final_output_path = os.path.join(full_output_dir, f"epoch_{end_epoch}")
 
                 # Cleanup: free accelerator resources and synchronize CUDA
@@ -1367,7 +1527,7 @@ class Qwen3FineTune:
 class Qwen3AudioCompare:
     # Class-level cache for speaker encoder
     _speaker_encoder = None
-    _speaker_encoder_model = None
+    _speaker_encoder_cache_key = None
 
     @classmethod
     def INPUT_TYPES(s):
@@ -1392,7 +1552,7 @@ class Qwen3AudioCompare:
 
     def _load_speaker_encoder(self, model_repo, local_model_path=""):
         """Load only the speaker encoder from a Base model (not the full model)."""
-        from safetensors.torch import load_file
+        from safetensors import safe_open
         from qwen_tts.core.models.modeling_qwen3_tts import Qwen3TTSSpeakerEncoder
 
         # Get local model path - use provided path if non-empty, otherwise fall back to default
@@ -1402,7 +1562,7 @@ class Qwen3AudioCompare:
             model_path = get_local_model_path(model_repo)
 
         # Check if already cached (use resolved path as cache key)
-        if Qwen3AudioCompare._speaker_encoder is not None and Qwen3AudioCompare._speaker_encoder_model == model_path:
+        if Qwen3AudioCompare._speaker_encoder is not None and Qwen3AudioCompare._speaker_encoder_cache_key == model_path:
             return Qwen3AudioCompare._speaker_encoder
         if not os.path.exists(model_path):
             raise ValueError(f"Base model not found at {model_path}. Please download it first using Qwen3-TTS Loader.")
@@ -1412,6 +1572,10 @@ class Qwen3AudioCompare:
         with open(config_path, 'r', encoding='utf-8') as f:
             config_dict = json.load(f)
 
+        # Validate this is a Base model with speaker encoder
+        if "speaker_encoder_config" not in config_dict:
+            raise ValueError(f"Model at {model_path} does not contain speaker_encoder_config. Only Base models (e.g., Qwen3-TTS-12Hz-0.6B-Base) include the speaker encoder.")
+
         # Create speaker encoder config
         from qwen_tts.core.models.configuration_qwen3_tts import Qwen3TTSSpeakerEncoderConfig
         speaker_config = Qwen3TTSSpeakerEncoderConfig(**config_dict["speaker_encoder_config"])
@@ -1419,16 +1583,13 @@ class Qwen3AudioCompare:
         # Instantiate speaker encoder
         speaker_encoder = Qwen3TTSSpeakerEncoder(speaker_config)
 
-        # Load only speaker encoder weights from safetensors
+        # Load only speaker encoder weights from safetensors (selective loading to save memory)
         safetensors_path = os.path.join(model_path, "model.safetensors")
-        all_weights = load_file(safetensors_path)
-
-        # Filter to only speaker_encoder weights and remove prefix
         speaker_weights = {}
-        for k, v in all_weights.items():
-            if k.startswith("speaker_encoder."):
-                new_key = k[len("speaker_encoder."):]
-                speaker_weights[new_key] = v
+        with safe_open(safetensors_path, framework="pt") as f:
+            for key in f.keys():
+                if key.startswith("speaker_encoder."):
+                    speaker_weights[key[len("speaker_encoder."):]] = f.get_tensor(key)
 
         speaker_encoder.load_state_dict(speaker_weights)
         speaker_encoder.eval()
@@ -1439,7 +1600,7 @@ class Qwen3AudioCompare:
 
         # Cache it (use resolved path as key)
         Qwen3AudioCompare._speaker_encoder = speaker_encoder
-        Qwen3AudioCompare._speaker_encoder_model = model_path
+        Qwen3AudioCompare._speaker_encoder_cache_key = model_path
 
         print(f"Loaded speaker encoder from {model_repo} ({len(speaker_weights)} weights)")
         return speaker_encoder
