@@ -180,28 +180,64 @@ def convert_audio(wav, sr):
 
 def load_audio_input(audio_input):
     # audio_input is {"waveform": tensor, "sample_rate": int}
-    # waveform is [batch, channels, samples]
-    # We need (samples,) or (channels, samples) numpy for Qwen?
+    # waveform can be various formats: [B, C, T], [C, T], [T]
+    # We need (samples,) or (channels, samples) numpy for Qwen
     # Qwen accepts numpy array.
-    
+
     if audio_input is None:
         return None
-        
+
     waveform = audio_input["waveform"]
     sr = audio_input["sample_rate"]
-    
-    # Take first batch item
-    wav = waveform[0] # (channels, samples)
-    
-    # If multi-channel, maybe mix down or take first?
-    # For cloning, mono is usually fine.
-    if wav.shape[0] > 1:
-        wav = torch.mean(wav, dim=0) # Mix to mono
-    else:
-        wav = wav.squeeze(0) # (samples,)
-        
-    return (wav.numpy(), sr)
 
+    print(f"load_audio_input received: waveform.shape={waveform.shape}, waveform.dim={waveform.dim()}")
+
+    # Handle different waveform formats
+    if waveform.dim() == 0:
+        # 0-dimensional tensor - this causes "Len() of unsized object"
+        raise ValueError(f"Waveform is 0-dimensional (scalar tensor). This causes 'Len() of unsized object' error.")
+
+    elif waveform.dim() == 1:
+        # Already [samples], just return as-is
+        wav = waveform
+        print(f"Format [samples], returning as-is")
+
+    elif waveform.dim() == 2:
+        # Could be [C, T] or [T, C]
+        if waveform.shape[0] < waveform.shape[1]:
+            # Likely [C, T] - channels first
+            if waveform.shape[0] > 1:
+                wav = torch.mean(waveform, dim=0)  # Mix to mono
+            else:
+                wav = waveform[0]  # Take single channel
+            print(f"Format [C, T], mixed to mono: {wav.shape}")
+        else:
+            # Likely [T, C] - samples first (shouldn't happen normally)
+            if waveform.shape[1] > 1:
+                wav = torch.mean(waveform, dim=1)  # Mix to mono
+            else:
+                wav = waveform[:, 0]
+            wav = wav.unsqueeze(0)  # Add channel dimension back
+            print(f"Format [T, C], converted: {wav.shape}")
+
+    elif waveform.dim() == 3:
+        # Expected [B, C, T] - take first batch
+        wav = waveform[0]  # (channels, samples)
+        if wav.shape[0] > 1:
+            wav = torch.mean(wav, dim=0)  # Mix to mono
+        else:
+            wav = wav.squeeze(0)  # (samples,)
+        print(f"Format [B, C, T], took first batch and mixed: {wav.shape}")
+
+    else:
+        raise ValueError(f"Unexpected waveform dimension: {waveform.dim()} (shape: {waveform.shape})")
+
+    # Ensure we have a 1D tensor
+    if wav.dim() > 1:
+        wav = wav.squeeze()
+        print(f"Squeezed to 1D: {wav.shape}")
+
+    return (wav.numpy(), sr)
 
 class Qwen3Loader:
     @classmethod
