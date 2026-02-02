@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.0] - 2026-01-31
+
+### Added
+- Support for other audio loading nodes (e.g., base64 to audio for ComfyUI endpoints) (PR #24)
+- `checkpoint_path` parameter to Qwen3Loader for loading intermediate training checkpoints
+- `save_optimizer_state` option to control checkpoint size (disabled = ~50% smaller checkpoints)
+- Automatic bf16→fp32 fallback for pre-Ampere GPUs
+- Easy voice clone workflow example
+
+### Changed
+- Unified checkpoint format using `pytorch_model.bin` only for consistency
+- Split checkpoint saving into `save_training_checkpoint()` (lightweight resume) and `save_final_model()` (inference-ready)
+- Intermediate checkpoints renamed to `ckpt_step_N` and `ckpt_epoch_N` to distinguish from final models
+- AudioCompare now uses `safe_open()` for memory-efficient speaker encoder loading (~3.4GB → ~300KB RAM)
+- Removed fp16 from mixed_precision options (only bf16/fp32 supported)
+
+### Fixed
+- DDP/FSDP compatibility: unwrap model for attribute access in training
+- Resume training from `ckpt_step_N` checkpoint folders
+- Total steps calculation now uses optimizer update steps (fixes progress display with gradient accumulation)
+- Auto-detect checkpoint vs full model path in Qwen3Loader
+- Speaker mapping from checkpoint config now applies correctly
+- `tts_model_type` injection for Base-trained checkpoints
+- RANK environment variable errors on single-GPU setups
+
+### Contributors
+- @bmgjet - Audio loading node support (PR #24)
+- @rekuenkdr - Checkpoint refactoring, DDP fixes, AudioCompare optimizations (PR #27)
+
 ## [1.6.1] - 2026-01-29
 
 ### Added
